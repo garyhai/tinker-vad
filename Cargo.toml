@@ -8,3 +8,7 @@ candle-core = "0.8.1"
 candle-onnx = "0.8.1"
 hf-hub = "0.3.2"
 log = "0.4.22"
+
+[dev-dependencies]
+env_logger = "0.11.5"
+rodio = "0.20.1"
