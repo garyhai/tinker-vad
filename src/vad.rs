@@ -20,29 +20,21 @@ use crate::select_device;
 /// Supported sample rates.
 pub const SAMPLE_RATES: [usize; 2] = [8000, 16000];
 /// Chunk sizes for 8kHz sample rate.
-pub const CHUNKS_SR8K: [usize; 3] = [256, 512, 768];
+pub const CHUNKS_SR8K: usize = 256;
 /// Chunk sizes for 16kHz sample rate.
-pub const CHUNKS_SR16K: [usize; 3] = [512, 1024, 1536];
+pub const CHUNKS_SR16K: usize = 512;
 
 static DEFAULT_MODEL_NAME: &str = "onnx-community/silero-vad";
 static DEFAULT_MODEL_FILE: &str = "onnx/model.onnx";
 static DEFAULT_SAMPLE_RATE: usize = 16000;
-static DEFAULT_MIN_SPEECH: usize = 250; // milliseconds for all time units
-static DEFAULT_MAX_SPEECH: usize = 60_000;
-static DEFAULT_MIN_SILENCE: usize = 100;
-static DEFAULT_MIN_SILENCE_AT_MAX_SPEECH: usize = 98;
-static DEFAULT_SPEECH_PAD: usize = 400;
+static DEFAULT_SILENCE: usize = 400; // all times are in milliseconds.
 
-/// Voice Activity Detection (VAD) struct.
-pub struct Vad {
-  /// Model file path.
-  pub model_file: Option<String>,
+#[derive(Debug, Clone)]
+pub struct VadConfig {
   /// Force inference to use CPU.
   pub use_cpu: bool,
   /// Sample rate, default is 16000.
   pub sample_rate: usize,
-  /// Chunk size for audio frames, in samples.
-  pub chunk_size: usize,
   /// Minimum speech duration in samples. Segments shorter than this will be discarded.
   pub min_speech: usize,
   /// Maximum speech duration in samples. Segments longer than this will be split.
@@ -61,6 +53,58 @@ pub struct Vad {
   pub timestamp_offset: bool,
   // Context size.
   pub context_size: usize,
+}
+
+impl Default for VadConfig {
+  fn default() -> Self {
+    Self::new(DEFAULT_SILENCE, DEFAULT_SAMPLE_RATE)
+  }
+}
+
+impl VadConfig {
+  pub fn new(min_silence: usize, sample_rate: usize) -> Self {
+    let context_size = if sample_rate == 8000 { 32 } else { 64 };
+    VadConfig {
+      min_silence,
+      sample_rate,
+      context_size,
+      use_cpu: false,
+      threshold: 0.5,
+      hysteresis: 0.15,
+      min_speech: 250,
+      max_speech: 60_000,
+      min_silence_at_max_speech: 98,
+      speech_pad: min_silence,
+      timestamp_offset: false,
+    }
+  }
+}
+
+/// Voice Activity Detection (VAD) struct.
+pub struct Vad {
+  pub config: VadConfig,
+  /// Sample rate, default is 16000.
+  sample_rate: usize,
+  /// Chunk size for audio frames, in samples.
+  chunk_size: usize,
+  /// Minimum speech duration in samples. Segments shorter than this will be discarded.
+  min_speech: usize,
+  /// Maximum speech duration in samples. Segments longer than this will be split.
+  max_speech: usize,
+  /// Minimum silence duration in samples. This value is crucial and affects the granularity of speech segments.
+  min_silence: usize,
+  /// Length of the last silence segment to consider when maximum speech length is reached, in samples.
+  min_silence_at_max_speech: usize,
+  /// Padding duration in samples added before and after each speech segment.
+  speech_pad: usize,
+  /// Speech threshold. Probabilities above this value are considered speech.
+  threshold: f32,
+  /// Hysteresis value for speech detection. Default is 0.15, corresponding to a threshold of 0.5 - 0.15 = 0.35.
+  hysteresis: f32,
+  /// Whether to return timestamps in milliseconds. Default is false, returns sample offsets.
+  timestamp_offset: bool,
+  // Context size.
+  context_size: usize,
   // Speech threshold in hysteresis state, corresponding to threshold - hysteresis.
   neg_threshold: f32,
   // Processor device for inference.
@@ -70,7 +114,7 @@ pub struct Vad {
   // Input data vector.
   state: Vec<Tensor>,
   // Is speaking.
-  pub triggered: bool,
+  triggered: bool,
   // Current stream end position.
   head: usize,
   // Current stream start position.
@@ -97,8 +141,7 @@ pub struct Vad {
 impl fmt::Debug for Vad {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("Vad")
-      .field("model_file", &self.model_file)
-      .field("use_cpu", &self.use_cpu)
+      .field("config", &self.config)
       .field("sample_rate", &self.sample_rate)
       .field("chunk_size", &self.chunk_size)
       .field("threshold", &self.threshold)
@@ -128,49 +171,43 @@ impl fmt::Debug for Vad {
   }
 }
 
+impl Default for Vad {
+  fn default() -> Self {
+    Vad::new(VadConfig::default())
+  }
+}
+
 impl Vad {
   /// Creates a new `Vad` instance.
-  pub fn new(
-    model: impl Into<Option<String>>,
-    sample_rate: Option<usize>,
-    chunk_size: Option<usize>,
-  ) -> Self {
-    let model_file = model.into();
-    let use_cpu = false;
-    let sample_rate = sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
-    let chunk_size =
-      chunk_size.unwrap_or(if sample_rate == 8000 { 256 } else { 512 });
-
-    let min_speech = sample_rate * DEFAULT_MIN_SPEECH / 1000;
-    let speech_pad = sample_rate * DEFAULT_SPEECH_PAD / 1000;
+  pub fn new(config: VadConfig) -> Self {
+    let sr = config.sample_rate;
+    let chunk_size = if sr == 8000 { CHUNKS_SR8K } else { CHUNKS_SR16K };
+    let min_speech = sr * config.min_speech / 1000;
+    let speech_pad = sr * config.speech_pad / 1000;
     // Refine max_speech to avoid cutting speech.
     let max_speech =
-      sample_rate * DEFAULT_MAX_SPEECH / 1000 - chunk_size - 2 * speech_pad;
-    let min_silence = sample_rate * DEFAULT_MIN_SILENCE / 1000;
+      sr * config.max_speech / 1000 - chunk_size - 2 * speech_pad;
+    let min_silence = sr * config.min_silence / 1000;
     let min_silence_at_max_speech =
-      sample_rate * DEFAULT_MIN_SILENCE_AT_MAX_SPEECH / 1000;
-    let threshold = 0.5;
-    let hysteresis = 0.15;
-    let neg_threshold = threshold - hysteresis;
-    let context_size = if sample_rate == 8000 { 32 } else { 64 };
-    let timestamp_offset = false;
+      sr * config.min_silence_at_max_speech / 1000;
+    let device = select_device(config.use_cpu).unwrap();
+    let neg_threshold = config.threshold - config.hysteresis;
 
     Vad {
-      model_file,
-      use_cpu,
-      sample_rate,
-      chunk_size,
+      sample_rate: sr,
+      chunk_size: chunk_size,
       min_speech,
       max_speech,
       min_silence,
       min_silence_at_max_speech,
       speech_pad,
-      threshold,
-      hysteresis,
+      device,
       neg_threshold,
-      context_size,
-      timestamp_offset,
-      device: Device::Cpu,
+      threshold: config.threshold,
+      hysteresis: config.hysteresis,
+      context_size: config.context_size,
+      timestamp_offset: config.timestamp_offset,
+      config,
       model: None,
       state: vec![],
       triggered: false,
@@ -187,23 +224,44 @@ impl Vad {
     }
   }
 
+  pub fn apply_config(&mut self) -> Result<()> {
+    let sr = self.config.sample_rate;
+    self.sample_rate = sr;
+    self.chunk_size = if sr == 8000 { CHUNKS_SR8K } else { CHUNKS_SR16K };
+    self.min_speech = sr * self.config.min_speech / 1000;
+    self.speech_pad = sr * self.config.speech_pad / 1000;
+    self.max_speech = sr * self.config.max_speech / 1000
+      - self.chunk_size
+      - 2 * self.speech_pad;
+    self.min_silence = sr * self.config.min_silence / 1000;
+    self.min_silence_at_max_speech =
+      sr * self.config.min_silence_at_max_speech / 1000;
+    self.neg_threshold = self.config.threshold - self.config.hysteresis;
+    self.threshold = self.config.threshold;
+    self.hysteresis = self.config.hysteresis;
+    self.context_size = self.config.context_size;
+    self.timestamp_offset = self.config.timestamp_offset;
+
+    self.verify()
+  }
+
   /// Loads the VAD model.
-  pub fn load(&mut self) -> Result<()> {
+  pub fn load(&mut self, model_file: impl AsRef<str>) -> Result<()> {
     self.verify()?;
     self.reset()?;
-    let model = if let Some(model_file) = &self.model_file {
-      candle_onnx::read_file(model_file)?
-    } else {
+    let model_file = model_file.as_ref();
+    let model = if model_file.is_empty() {
       let model_file = hf_hub::api::sync::Api::new()
         .and_then(|api| {
           api.model(DEFAULT_MODEL_NAME.into()).get(DEFAULT_MODEL_FILE)
         })
         .map_err(Error::wrap)?;
       candle_onnx::read_file(model_file)?
+    } else {
+      candle_onnx::read_file(model_file)?
     };
     self.model = Some(model);
-    self.device = select_device(self.use_cpu)?;
-    log::debug!(
+    log::info!(
       "silero vad is loaded with capibilites \
       [avx: {}, neon: {}, simd128: {}, f16c: {}]",
       utils::with_avx(),
@@ -256,7 +314,7 @@ impl Vad {
   }
 
   /// Segments the provided audio data.
-  pub fn segment(&mut self, audio: &[f32]) -> Result<usize> {
+  pub fn segment_audio(&mut self, audio: &[f32]) -> Result<usize> {
     let mut count = 0;
     let chunk_size = self.chunk_size;
     let audio = if !self.buffer.is_empty() {
@@ -290,7 +348,7 @@ impl Vad {
   }
 
   /// Returns the list of detected speech segments.
-  pub fn segments(&self) -> Cow<'_, [(usize, usize)]> {
+  pub fn get_segments(&self) -> Cow<'_, [(usize, usize)]> {
     if self.timestamp_offset {
       Cow::Owned(
         self
@@ -315,20 +373,6 @@ impl Vad {
   pub fn is_idle(&self) -> bool {
     self.segments.is_empty() && !self.triggered
   }
-
-  //   pub fn is_voice_segment(&self, audio: &[f32]) -> Result<bool> {
-  //     let samples =
-  //       audio.iter().map(|x| i16::from_sample(*x)).collect::<Vec<_>>();
-  //     let mut vad = self.vad.lock().unwrap();
-  //     let is_voice = vad.is_voice_segment(&samples).map_err(|_| {
-  //       anyhow!(
-  //         "invalid frame length: {} with sample_rate {}.",
-  //         samples.len(),
-  //         self.sample_rate
-  //       )
-  //     })?;
-  //     Ok(is_voice)
-  //   }
 
   /// Resets the VAD state.
   pub fn reset(&mut self) -> Result<()> {
@@ -363,22 +407,6 @@ impl Vad {
         "invalid sample rate: {}, only support 8000 or 16000.",
         self.sample_rate
       );
-    }
-
-    if self.sample_rate == 8000 {
-      if !CHUNKS_SR8K.contains(&self.chunk_size) {
-        bail!(
-          "invalid chunk size: {}, only support 256, 512, 768.",
-          self.chunk_size
-        );
-      }
-    } else {
-      if !CHUNKS_SR16K.contains(&self.chunk_size) {
-        bail!(
-          "invalid chunk size: {}, only support 512, 1024, 1536.",
-          self.chunk_size
-        );
-      }
     }
 
     //TODO: add more checks for config values.
